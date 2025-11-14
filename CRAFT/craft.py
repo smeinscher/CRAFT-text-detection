@@ -14,7 +14,7 @@ from CRAFT.fp16 import FP16Module
 
 
 class double_conv(nn.Module):
-    
+
     def __init__(self, in_ch, mid_ch, out_ch):
         super(double_conv, self).__init__()
         self.conv = nn.Sequential(
@@ -32,12 +32,12 @@ class double_conv(nn.Module):
 
 
 class CRAFT(nn.Module):
-    
-    def __init__(self, pretrained=False, freeze=False):
+
+    def __init__(self, weights=False, freeze=False):
         super(CRAFT, self).__init__()
 
         """ Base network """
-        self.basenet = vgg16_bn(pretrained, freeze)
+        self.basenet = vgg16_bn(weights, freeze)
 
         """ U network """
         self.upconv1 = double_conv(1024, 512, 256)
@@ -59,7 +59,7 @@ class CRAFT(nn.Module):
         init_weights(self.upconv3.modules())
         init_weights(self.upconv4.modules())
         init_weights(self.conv_cls.modules())
-        
+
     def forward(self, x):
         """ Base network """
         sources = self.basenet(x)
@@ -68,26 +68,30 @@ class CRAFT(nn.Module):
         y = torch.cat([sources[0], sources[1]], dim=1)
         y = self.upconv1(y)
 
-        y = F.interpolate(y, size=sources[2].size()[2:], mode='bilinear', align_corners=False)
+        y = F.interpolate(y, size=sources[2].size()[
+                          2:], mode='bilinear', align_corners=False)
         y = torch.cat([y, sources[2]], dim=1)
         y = self.upconv2(y)
 
-        y = F.interpolate(y, size=sources[3].size()[2:], mode='bilinear', align_corners=False)
+        y = F.interpolate(y, size=sources[3].size()[
+                          2:], mode='bilinear', align_corners=False)
         y = torch.cat([y, sources[3]], dim=1)
         y = self.upconv3(y)
 
-        y = F.interpolate(y, size=sources[4].size()[2:], mode='bilinear', align_corners=False)
+        y = F.interpolate(y, size=sources[4].size()[
+                          2:], mode='bilinear', align_corners=False)
         y = torch.cat([y, sources[4]], dim=1)
         feature = self.upconv4(y)
 
         y = self.conv_cls(feature)
 
-        return y.permute(0,2,3,1), feature
+        return y.permute(0, 2, 3, 1), feature
 
 
 def init_CRAFT_model(chekpoint_path: str, device: str, fp16: bool = True) -> CRAFT:
     net = CRAFT()
-    net.load_state_dict(copyStateDict(torch.load(chekpoint_path, map_location=torch.device('cpu'))))
+    net.load_state_dict(copyStateDict(torch.load(
+        chekpoint_path, map_location=torch.device('cpu'))))
     if fp16:
         net = FP16Module(net)
     net = net.to(device)

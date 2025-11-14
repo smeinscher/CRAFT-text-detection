@@ -6,7 +6,9 @@ from torch.autograd import Variable
 from PIL import Image
 import numpy as np
 import cv2
-from huggingface_hub import hf_hub_url, cached_download
+from multiprocessing import Pool
+import functools
+from huggingface_hub import hf_hub_url, hf_hub_download
 
 from CRAFT.craft import CRAFT, init_CRAFT_model
 from CRAFT.refinenet import RefineNet, init_refiner_model
@@ -25,7 +27,7 @@ HF_MODELS = {
     )
 }
 
-    
+
 def preprocess_image(image: np.ndarray, canvas_size: int, mag_ratio: bool):
     # resize
     img_resized, target_ratio, size_heatmap = resize_aspect_ratio(
@@ -40,10 +42,21 @@ def preprocess_image(image: np.ndarray, canvas_size: int, mag_ratio: bool):
     return x, ratio_w, ratio_h
 
 
+def process_single(args):
+    text_score, link_score, ratio_w, ratio_h, text_threshold, link_threshold, low_text = args
+    boxes, polys = getDetBoxes(
+        text_score, link_score,
+        text_threshold, link_threshold,
+        low_text, False
+    )
+    boxes = adjustResultCoordinates(boxes, ratio_w, ratio_h)
+    return boxes
+
+
 class CRAFTModel:
-    
+
     def __init__(
-        self, 
+        self,
         cache_dir: str,
         device: torch.device,
         local_files_only: bool = False,
@@ -59,28 +72,31 @@ class CRAFTModel:
         self.use_refiner = use_refiner
         self.device = device
         self.fp16 = fp16
-        
+
         self.canvas_size = canvas_size
         self.mag_ratio = mag_ratio
         self.text_threshold = text_threshold
         self.link_threshold = link_threshold
         self.low_text = low_text
-        
+
         # loading models
         paths = {}
         for model_name in ['craft', 'refiner']:
             config = HF_MODELS[model_name]
             paths[model_name] = os.path.join(cache_dir, config['filename'])
             if not local_files_only:
-                config_file_url = hf_hub_url(repo_id=config['repo_id'], filename=config['filename'])
-                cached_download(config_file_url, cache_dir=cache_dir, force_filename=config['filename'])
-            
+                paths[model_name] = hf_hub_download(
+                    repo_id=config['repo_id'],
+                    filename=config['filename'],
+                    cache_dir=cache_dir
+                )
+
         self.net = init_CRAFT_model(paths['craft'], device, fp16=fp16)
         if self.use_refiner:
             self.refiner = init_refiner_model(paths['refiner'], device)
         else:
             self.refiner = None
-        
+
     def get_text_map(self, x: torch.Tensor, ratio_w: int, ratio_h: int) -> Tuple[np.ndarray, np.ndarray]:
         x = x.to(self.device)
 
@@ -89,31 +105,82 @@ class CRAFTModel:
             y, feature = self.net(x)
 
         # make score and link map
-        score_text = y[0,:,:,0].cpu().data.numpy()
-        score_link = y[0,:,:,1].cpu().data.numpy()
+        score_text = y[0, :, :, 0].cpu().data.numpy()
+        score_link = y[0, :, :, 1].cpu().data.numpy()
 
         # refine link
         if self.refiner:
             with torch.no_grad():
                 y_refiner = self.refiner(y, feature)
-            score_link = y_refiner[0,:,:,0].cpu().data.numpy()
-            
+            score_link = y_refiner[0, :, :, 0].cpu().data.numpy()
+
         return score_text, score_link
 
+    def get_batch_polygons(self, batch_images: torch.Tensor, ratios_w: torch.Tensor, ratios_h: torch.Tensor):
+        """Batch process pre-normalized images on GPU"""
+        # Forward pass
+        # batch_images = batch_images.float()  # Convert to float32
+        if self.fp16:
+            batch_images = batch_images.half()  # Convert to half if using fp16
+
+        with torch.no_grad():
+            y, feature = self.net(batch_images.to(self.device))
+            if self.refiner:
+                y_refiner = self.refiner(y, feature)
+                link_scores = y_refiner[..., 0]  # [B, H, W]
+            else:
+                link_scores = y[..., 1]  # [B, H, W]
+
+            text_scores = y[..., 0]  # [B, H, W]
+
+        batch_size = batch_images.size(0)
+        text_scores = text_scores.detach().cpu().numpy()
+        link_scores = link_scores.detach().cpu().numpy()
+
+        ratios_w = ratios_w.cpu().numpy()
+        ratios_h = ratios_h.cpu().numpy()
+
+        with Pool(processes=os.cpu_count()) as pool:
+            batch_args = [(text_scores[i], link_scores[i], ratios_w[i], ratios_h[i],
+                           self.text_threshold, self.link_threshold, self.low_text)
+                          for i in range(batch_size)]
+            batch_polys = pool.map(process_single, batch_args)
+
+        return batch_polys
+
+    def _convex_hull(self, x_coords, y_coords):
+        """Simple convex hull approximation for GPU tensors"""
+        # For character detection, a simple bounding box is often sufficient
+        min_x = torch.min(x_coords)
+        max_x = torch.max(x_coords)
+        min_y = torch.min(y_coords)
+        max_y = torch.max(y_coords)
+
+        # Create rectangle corners
+        pts = torch.tensor([
+            [min_x, min_y],
+            [max_x, min_y],
+            [max_x, max_y],
+            [min_x, max_y]
+        ], device=x_coords.device)
+
+        return pts
+
     def get_polygons(self, image: Image.Image) -> List[List[List[int]]]:
-        x, ratio_w, ratio_h = preprocess_image(np.array(image), self.canvas_size, self.mag_ratio)
-        
+        x, ratio_w, ratio_h = preprocess_image(
+            np.array(image), self.canvas_size, self.mag_ratio)
+
         score_text, score_link = self.get_text_map(x, ratio_w, ratio_h)
-        
+
         # Post-processing
         boxes, polys = getDetBoxes(
-            score_text, score_link, 
-            self.text_threshold, self.link_threshold, 
+            score_text, score_link,
+            self.text_threshold, self.link_threshold,
             self.low_text, True
         )
         boxes = adjustResultCoordinates(boxes, ratio_w, ratio_h)
         for k in range(len(polys)):
-            if polys[k] is None: 
+            if polys[k] is None:
                 polys[k] = boxes[k]
             else:
                 polys[k] = adjustResultCoordinates(polys[k], ratio_w, ratio_h)
@@ -122,28 +189,29 @@ class CRAFTModel:
         for poly in polys:
             res.append(poly.astype(np.int32).tolist())
         return res
-    
+
     def _get_boxes_preproc(self, x, ratio_w, ratio_h) -> List[List[List[int]]]:
         score_text, score_link = self.get_text_map(x, ratio_w, ratio_h)
-        
+
         # Post-processing
         boxes, polys = getDetBoxes(
-            score_text, score_link, 
-            self.text_threshold, self.link_threshold, 
+            score_text, score_link,
+            self.text_threshold, self.link_threshold,
             self.low_text, False
         )
-        
+
         boxes = adjustResultCoordinates(boxes, ratio_w, ratio_h)
         boxes_final = []
-        if len(boxes)>0:
+        if len(boxes) > 0:
             boxes = boxes.astype(np.int32).tolist()
             for box in boxes:
                 boxes_final.append([box[0], box[2]])
 
         return boxes_final
-    
+
     def get_boxes(self, image: Image.Image) -> List[List[List[int]]]:
-        x, ratio_w, ratio_h = preprocess_image(np.array(image), self.canvas_size, self.mag_ratio)
-        
+        x, ratio_w, ratio_h = preprocess_image(
+            np.array(image), self.canvas_size, self.mag_ratio)
+
         boxes_final = self._get_boxes_preproc(x, ratio_w, ratio_h)
         return boxes_final
